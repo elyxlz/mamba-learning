@@ -70,10 +70,6 @@ def ssd(x, A, B, C, chunk_size, initial_states=None):
 
 class RMSNorm(torch.nn.Module):
     def __init__(self, d: int, eps: float = 1e-5):
-        """Gated Root Mean Square Layer Normalization
-
-        Paper: https://arxiv.org/abs/1910.07467
-        """
         super().__init__()
         self.eps = eps
         self.weight = torch.nn.Parameter(torch.ones(d))
@@ -109,8 +105,8 @@ class InferenceCache(typing.NamedTuple):
         )
 
 
-class Mamba2(torch.nn.Module):
-    def __init__(self, config: Mamba2Config):
+class Mamba2Layer(torch.nn.Module):
+    def __init__(self, config: Mamba2Config) -> None:
         super().__init__()
         self.config = config
 
@@ -133,7 +129,9 @@ class Mamba2(torch.nn.Module):
         self.norm = RMSNorm(config.inner_dim)
         self.out_proj = torch.nn.Linear(config.inner_dim, config.hidden_dim, bias=False)
 
-    def forward(self, u: torch.Tensor, h: InferenceCache | None = None):
+    def forward(
+        self, u: torch.Tensor, h: InferenceCache | None = None
+    ) -> tuple[torch.Tensor, InferenceCache]:
         if h:
             return self.step(u, h)
 
@@ -227,59 +225,56 @@ class Mamba2(torch.nn.Module):
         return y.unsqueeze(1), h
 
 
-class Mamba2LMHeadModel(torch.nn.Module):
+class Mamba2(torch.nn.Module):
     def __init__(self, config: Mamba2Config) -> None:
         super().__init__()
         self.config = config
 
-        self.backbone = torch.nn.ModuleDict(
-            dict(
-                embedding=torch.nn.Embedding(config.vocab_size, config.hidden_dim),
-                layers=torch.nn.ModuleList(
-                    [
-                        torch.nn.ModuleDict(
-                            dict(
-                                mixer=Mamba2(
-                                    config,
-                                ),
-                                norm=RMSNorm(
-                                    config.hidden_dim,
-                                ),
-                            )
-                        )
-                        for _ in range(config.num_layers)
-                    ]
-                ),
-                norm_f=RMSNorm(config.hidden_dim),
-            )
+        self.input_proj = torch.nn.Linear(
+            config.input_dim, out_features=config.hidden_dim, bias=False
         )
+
+        self.layers = torch.nn.ModuleList(
+            [
+                torch.nn.ModuleDict(
+                    dict(
+                        mixer=Mamba2Layer(
+                            config,
+                        ),
+                        norm=RMSNorm(
+                            config.hidden_dim,
+                        ),
+                    )
+                )
+                for _ in range(config.num_layers)
+            ]
+        )
+        self.norm = RMSNorm(config.hidden_dim)
+
         self.head = torch.nn.Linear(config.hidden_dim, config.input_dim * 2, bias=False)
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        x: torch.Tensor,
         h: list[InferenceCache] | list[None] | None = None,
     ) -> tuple[torch.Tensor, list[InferenceCache]]:
-        seqlen = input_ids.shape[1]
+        seqlen = x.shape[1]
 
         if h is None:
             h = [None for _ in range(self.config.num_layers)]
 
-        x = self.backbone.embedding(input_ids)
-        for i, layer in enumerate(self.backbone.layers):
+        x = self.input_proj(x)
+        for i, layer in enumerate(self.layers):
             y, h[i] = layer.mixer(layer.norm(x), h[i])
             x = y + x
 
-        x = self.backbone.norm_f(x)
-        logits = self.lm_head(x)
-        return logits[:, :seqlen], typing.cast(list[InferenceCache], h)
+        x = self.norm(x)
+        x = self.head(x)
+        return x[:, :seqlen], typing.cast(list[InferenceCache], h)
 
-    def generate(
-        self,
-        input_ids: torch.Tensor,
-        max_new_length: int = 20,
-    ) -> typing.Iterable[tuple[int, list[InferenceCache]]]:
-        prefix, tokens = input_ids[:-1], input_ids[-1:].unsqueeze(0)
+    @torch.inference_mode()
+    def generate(self, prompt: torch.Tensor, max_new_length: int = 20) -> torch.Tensor:
+        prefix, tokens = prompt[:-1], prompt[-1:].unsqueeze(0)
 
         # Process prompt
         # The input sequence to forward (non-inference path) must have length multiple that of chunk_size.
@@ -293,15 +288,24 @@ class Mamba2LMHeadModel(torch.nn.Module):
                 InferenceCache.alloc(1, self.config, device=self.device)
                 for _ in range(self.config.num_layers)
             ]
+
+        # prefill
         for i in range(n_chunked, prefix.shape[0]):
             _, h = self(prefix[i : i + 1].unsqueeze(0), h)
 
         # Generate
         for _ in range(max_new_length):
-            with torch.no_grad():
-                out, h = self(tokens, h)
-            logits = out[0, -1]
-            probs = torch.nn.functional.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
+            out, h = self(tokens, h)
+            last = out[0, -1]
+            mean, var = last.chunk(2, dim=-1)
+            next_token = torch.randn_like(mean) * var + mean
             tokens = next_token.unsqueeze(0)
-            yield typing.cast(int, next_token.item()), h
+
+        return tokens
+
+
+if __name__ == "__main__":
+    model = Mamba2(Mamba2Config())
+    seq = torch.randn(1, 64, 16)
+    out = model(seq)
+    breakpoint()
