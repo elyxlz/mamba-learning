@@ -1,0 +1,11 @@
+[project]
+name = "mamba-learning"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["einops", "torch", "numpy>=2.1.1"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
